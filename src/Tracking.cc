@@ -29,6 +29,7 @@
 #include "MLPnPsolver.h"
 #include "GeometricTools.h"
 
+
 #include <iostream>
 
 #include <mutex>
@@ -128,6 +129,22 @@ Tracking::Tracking(System *pSys, ORBVocabulary* pVoc, FrameDrawer *pFrameDrawer,
     vdNewKF_ms.clear();
     vdTrackTotal_ms.clear();
 #endif
+
+    mpDepthEnhancer = nullptr; 
+    if(mSensor==System::RGBD || mSensor==System::IMU_RGBD) { 
+    ORB_SLAM3::DepthEnhancer::Config config; 
+    config.fx = mK.at<float>(0,0); 
+    config.fy = mK.at<float>(1,1); 
+    config.cx = mK.at<float>(0,2); 
+    config.cy = mK.at<float>(1,2); 
+    //Parameter  
+    config.maxHistorySize = 5;
+    config.maxKeyFrames = 3;
+    config.patchSize = 3;
+    config.processingStep = 2; // Process every 2nd pixel
+    mpDepthEnhancer = new ORB_SLAM3::DepthEnhancer(config);
+    cout << "[DepthEnhancer] Initialized for RGB-D (Jetson optimized)" << endl; }
+
 }
 
 #ifdef REGISTER_TIMES
@@ -529,6 +546,11 @@ void Tracking::PrintTimeStats()
 Tracking::~Tracking()
 {
     //f_track_stats.close();
+    if(mpDepthEnhancer){
+    	delete mpDepthEnhancer;
+    	mpDepthEnhancer = nullptr;
+    	
+    }
 
 }
 
@@ -1536,6 +1558,64 @@ Sophus::SE3f Tracking::GrabImageRGBD(const cv::Mat &imRGB,const cv::Mat &imD, co
         else
             cvtColor(mImGray,mImGray,cv::COLOR_BGRA2GRAY);
     }
+    
+    
+     // ========== Depth Enhancement 추가 ==========
+    if(mpDepthEnhancer && mState == OK && mpLastKeyFrame)
+    {
+        try {
+            // 마지막 키프레임의 포즈 가져오기
+            Sophus::SE3f lastPoseSE3 = mpLastKeyFrame->GetPose();
+            Eigen::Matrix4f lastPose = lastPoseSE3.matrix();
+            
+            // 마지막 키프레임의 특징점들
+            vector<cv::KeyPoint> lastKeypoints = mpLastKeyFrame->mvKeys;
+            cv::Mat lastDescriptors = mpLastKeyFrame->mDescriptors;
+            
+            // 키프레임 여부 확인 (간단한 휴리스틱)
+            bool isKeyFrame = false;
+            if(mpLocalMapper && mpLocalMapper->AcceptKeyFrames())
+            {
+                // 마지막 키프레임으로부터 일정 프레임 이상 지났으면
+                if(mCurrentFrame.mnId > mnLastKeyFrameId + 5)
+                {
+                    isKeyFrame = true;
+                }
+            }
+            
+            // Enhancement 수행
+            auto enhanceStart = chrono::steady_clock::now();
+            
+            imDepth = mpDepthEnhancer->enhanceDepth(
+                imD,
+                imRGB,
+                lastPose,
+                lastKeypoints,
+                lastDescriptors,
+                timestamp,
+                isKeyFrame
+            );
+            
+            auto enhanceEnd = chrono::steady_clock::now();
+            
+            // 30프레임마다 성능 출력
+            if(mCurrentFrame.mnId % 30 == 0)
+            {
+                double ms = chrono::duration<double, milli>(enhanceEnd - enhanceStart).count();
+                auto stats = mpDepthEnhancer->getLastTiming();
+                cout << "[DepthEnhancer] Total: " << ms << "ms"
+                     << " (Fusion: " << stats.fusion << "ms"
+                     << ", Refine: " << stats.refinement << "ms)" << endl;
+            }
+        }
+        catch(exception& e) {
+            cerr << "[DepthEnhancer] Error: " << e.what() << endl;
+            imDepth = imD;  // 실패시 원본 사용
+        }
+    }
+    // ========== Depth Enhancement 끝 ==========
+
+    
 
     if((fabs(mDepthMapFactor-1.0f)>1e-5) || imDepth.type()!=CV_32F)
         imDepth.convertTo(imDepth,CV_32F,mDepthMapFactor);
@@ -1544,11 +1624,6 @@ Sophus::SE3f Tracking::GrabImageRGBD(const cv::Mat &imRGB,const cv::Mat &imD, co
         mCurrentFrame = Frame(mImGray,imDepth,timestamp,mpORBextractorLeft,mpORBVocabulary,mK,mDistCoef,mbf,mThDepth,mpCamera);
     else if(mSensor == System::IMU_RGBD)
         mCurrentFrame = Frame(mImGray,imDepth,timestamp,mpORBextractorLeft,mpORBVocabulary,mK,mDistCoef,mbf,mThDepth,mpCamera,&mLastFrame,*mpImuCalib);
-
-
-
-
-
 
     mCurrentFrame.mNameFile = filename;
     mCurrentFrame.mnDataset = mnNumDataset;
@@ -1787,7 +1862,12 @@ bool Tracking::PredictStateIMU()
 
 void Tracking::ResetFrameIMU()
 {
+    Verbose::PrintMess("   System Reseting ", Verbose::VERBOSITY_NORMAL);
     // TODO To implement...
+    if(mpDepthEnhancer)
+    {
+    	mpDepthEnhancer->reset();
+    }
 }
 
 
@@ -3868,8 +3948,11 @@ void Tracking::ResetActiveMap(bool bLocMap)
 
     // Clear Map (this erase MapPoints and KeyFrames)
     mpAtlas->clearMap();
-
-
+    
+    if(mpDepthEnhancer){
+    	mpDepthEnhancer->reset();
+    	}
+    
     //KeyFrame::nNextId = mpAtlas->GetLastInitKFid();
     //Frame::nNextId = mnLastInitFrameId;
     mnLastInitFrameId = Frame::nNextId;

@@ -36,7 +36,7 @@
 #include "System.h"
 #include "ImuTypes.h"
 #include "Settings.h"
-
+#include "DepthEnhancer.h"
 #include "GeometricCamera.h"
 
 #include <mutex>
@@ -356,7 +356,9 @@ protected:
     Sophus::SE3f mTlr;
 
     void newParameterLoader(Settings* settings);
-
+    
+    ORB_SLAM3::DepthEnhancer* mpDepthEnhancer;
+    
 #ifdef REGISTER_LOOP
     bool Stop();
 
